@@ -152,12 +152,19 @@ async function openAIChatCompletions(request, env, body) {
   const route = chooseUnlimitedRoute(body);
   const payload = buildUnlimitedPayload(body, route);
 
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+
   if (body.stream) {
     const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamOpenAIChat(upstream, { id, created, model }));
+    return sseResponse(streamOpenAIChat(upstream, { id, created, model, hasTools }));
   }
 
   const result = await collectUnlimitedText(request, env, route, payload);
+  const toolCalls = hasTools ? parseToolCallsFromText(result.text) : null;
+  const message = toolCalls
+    ? { role: "assistant", content: null, tool_calls: formatOpenAIToolCalls(toolCalls) }
+    : { role: "assistant", content: result.text };
+  const finishReason = toolCalls ? "tool_calls" : (result.finishReason || "stop");
   return jsonResponse({
     id,
     object: "chat.completion",
@@ -166,9 +173,9 @@ async function openAIChatCompletions(request, env, body) {
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content: result.text },
+        message,
         logprobs: null,
-        finish_reason: result.finishReason || "stop",
+        finish_reason: finishReason,
       },
     ],
     usage: usageFromText(payload.message || "", result.text),
@@ -290,20 +297,26 @@ async function anthropicMessages(request, env, body) {
   const route = chooseUnlimitedRoute(body);
   const payload = buildAnthropicUnlimitedPayload(body, route);
   const id = `msg_${randomId()}`;
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
 
   if (body.stream) {
     const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel }));
+    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel, hasTools }));
   }
 
   const result = await collectUnlimitedText(request, env, route, payload);
+  const toolCalls = hasTools ? parseToolCallsFromText(result.text) : null;
+  const content = toolCalls
+    ? formatAnthropicToolUseBlocks(toolCalls)
+    : [{ type: "text", text: result.text }];
+  const stopReason = toolCalls ? "tool_use" : anthropicStopReason(result.finishReason);
   return jsonResponse({
     id,
     type: "message",
     role: "assistant",
     model: requestedModel,
-    content: [{ type: "text", text: result.text }],
-    stop_reason: anthropicStopReason(result.finishReason),
+    content,
+    stop_reason: stopReason,
     stop_sequence: null,
     usage: anthropicUsageFromText(payload.message || "", result.text),
   });
@@ -388,7 +401,8 @@ function buildUnlimitedPayload(body, route) {
     };
   }
 
-  const message = body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "";
+  let message = body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "";
+  message = injectToolPrompt(message, body.tools, body.tool_choice);
   const payload = {
     message,
     model: mapUpstreamModel(body.model),
@@ -411,7 +425,8 @@ function buildAnthropicUnlimitedPayload(body, route) {
     };
   }
 
-  const prompt = anthropicMessagesToText(body);
+  let prompt = anthropicMessagesToText(body);
+  prompt = injectToolPrompt(prompt, body.tools, body.tool_choice);
   const payload = {
     message: prompt,
     model: mapUpstreamModel(body.model),
@@ -522,33 +537,79 @@ async function getModelCatalog(request, env) {
 }
 
 function streamOpenAIChat(upstream, meta) {
+  if (!meta.hasTools) {
+    return streamUnlimitedEvents(upstream, {
+      start(controller) {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+        });
+      },
+      delta(controller, text) {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+        });
+      },
+      finish(controller, reason) {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: {}, finish_reason: openAIStopReason(reason) }],
+        });
+        writeRawSse(controller, "data: [DONE]\n\n");
+      },
+    });
+  }
+
+  let buffer = "";
   return streamUnlimitedEvents(upstream, {
-    start(controller) {
-      writeSse(controller, {
-        id: meta.id,
-        object: "chat.completion.chunk",
-        created: meta.created,
-        model: meta.model,
-        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
-      });
-    },
-    delta(controller, text) {
-      writeSse(controller, {
-        id: meta.id,
-        object: "chat.completion.chunk",
-        created: meta.created,
-        model: meta.model,
-        choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-      });
+    start() {},
+    delta(_controller, text) {
+      buffer += text;
     },
     finish(controller, reason) {
-      writeSse(controller, {
-        id: meta.id,
-        object: "chat.completion.chunk",
-        created: meta.created,
-        model: meta.model,
-        choices: [{ index: 0, delta: {}, finish_reason: openAIStopReason(reason) }],
-      });
+      const toolCalls = parseToolCallsFromText(buffer);
+      if (toolCalls) {
+        const formatted = formatOpenAIToolCalls(toolCalls);
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: { role: "assistant", content: null, tool_calls: formatted }, finish_reason: null }],
+        });
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+        });
+      } else {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: { role: "assistant", content: buffer }, finish_reason: null }],
+        });
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: {}, finish_reason: openAIStopReason(reason) }],
+        });
+      }
       writeRawSse(controller, "data: [DONE]\n\n");
     },
   });
@@ -621,6 +682,48 @@ function streamOpenAIResponses(upstream, meta) {
 }
 
 function streamAnthropicMessages(upstream, meta) {
+  if (!meta.hasTools) {
+    return streamUnlimitedEvents(upstream, {
+      start(controller) {
+        writeSseEvent(controller, "message_start", {
+          type: "message_start",
+          message: {
+            id: meta.id,
+            type: "message",
+            role: "assistant",
+            model: meta.model,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        });
+        writeSseEvent(controller, "content_block_start", {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        });
+      },
+      delta(controller, text) {
+        writeSseEvent(controller, "content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text },
+        });
+      },
+      finish(controller, reason) {
+        writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
+        writeSseEvent(controller, "message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: anthropicStopReason(reason), stop_sequence: null },
+          usage: { output_tokens: 0 },
+        });
+        writeSseEvent(controller, "message_stop", { type: "message_stop" });
+      },
+    });
+  }
+
+  let buffer = "";
   return streamUnlimitedEvents(upstream, {
     start(controller) {
       writeSseEvent(controller, "message_start", {
@@ -636,26 +739,50 @@ function streamAnthropicMessages(upstream, meta) {
           usage: { input_tokens: 0, output_tokens: 0 },
         },
       });
-      writeSseEvent(controller, "content_block_start", {
-        type: "content_block_start",
-        index: 0,
-        content_block: { type: "text", text: "" },
-      });
     },
-    delta(controller, text) {
-      writeSseEvent(controller, "content_block_delta", {
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "text_delta", text },
-      });
+    delta(_controller, text) {
+      buffer += text;
     },
     finish(controller, reason) {
-      writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
-      writeSseEvent(controller, "message_delta", {
-        type: "message_delta",
-        delta: { stop_reason: anthropicStopReason(reason), stop_sequence: null },
-        usage: { output_tokens: 0 },
-      });
+      const toolCalls = parseToolCallsFromText(buffer);
+      if (toolCalls) {
+        const blocks = formatAnthropicToolUseBlocks(toolCalls);
+        blocks.forEach((block, idx) => {
+          writeSseEvent(controller, "content_block_start", {
+            type: "content_block_start",
+            index: idx,
+            content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+          });
+          writeSseEvent(controller, "content_block_delta", {
+            type: "content_block_delta",
+            index: idx,
+            delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
+          });
+          writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: idx });
+        });
+        writeSseEvent(controller, "message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "tool_use", stop_sequence: null },
+          usage: { output_tokens: 0 },
+        });
+      } else {
+        writeSseEvent(controller, "content_block_start", {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        });
+        writeSseEvent(controller, "content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: buffer },
+        });
+        writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
+        writeSseEvent(controller, "message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: anthropicStopReason(reason), stop_sequence: null },
+          usage: { output_tokens: 0 },
+        });
+      }
       writeSseEvent(controller, "message_stop", { type: "message_stop" });
     },
   });
@@ -690,7 +817,7 @@ function streamUnlimitedEvents(upstream, handlers) {
               handlers.delta && handlers.delta(controller, parsed.delta, parsed);
             }
 
-            if (parsed.finish || parsed.done) {
+            if ((parsed.finish || parsed.done) && !finished) {
               finished = true;
               handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
             }
@@ -894,10 +1021,6 @@ function messagesToText(messages) {
 function anthropicMessagesToText(body) {
   const parts = [];
   if (body.system) parts.push(`system: ${contentToText(body.system)}`);
-  if (Array.isArray(body.tools) && body.tools.length) {
-    parts.push(`available tools: ${JSON.stringify(body.tools)}`);
-    parts.push("If a tool is required, describe the intended tool call clearly. MCP and local tools must be executed by the client agent.");
-  }
   if (Array.isArray(body.messages)) parts.push(messagesToText(body.messages));
   return parts.filter(Boolean).join("\n\n");
 }
@@ -942,6 +1065,81 @@ function latestUserText(messages) {
     if ((messages[i].role || "user") === "user") return contentToText(messages[i].content);
   }
   return "";
+}
+
+function injectToolPrompt(message, tools, toolChoice) {
+  if (!Array.isArray(tools) || !tools.length) return message;
+  const defs = tools.map((t) => {
+    const fn = t.function || t;
+    const name = fn.name || t.name;
+    const desc = fn.description || t.description || "";
+    const params = fn.parameters || fn.input_schema || t.input_schema || {};
+    return `- ${name}(${Object.keys((params && params.properties) || {}).join(", ")}): ${desc}`;
+  }).join("\n");
+
+  let choiceHint = "If you do NOT need any tool, respond normally with plain text.";
+  if (toolChoice === "required" || toolChoice === "any") {
+    choiceHint = "You MUST use at least one tool. Do NOT respond with plain text.";
+  } else if (typeof toolChoice === "object" && toolChoice !== null) {
+    const forced = toolChoice.function?.name || toolChoice.name || "";
+    if (forced) choiceHint = `You MUST use the tool "${forced}". Do NOT respond with plain text.`;
+  }
+
+  const toolBlock = [
+    "system: You are a helpful assistant that has access to tools. When you need to use a tool, respond with ONLY a JSON code block in this exact format and nothing else:",
+    "```json",
+    '{"tool_calls": [{"name": "tool_name", "arguments": {"param": "value"}}]}',
+    "```",
+    "",
+    "Available tools:",
+    defs,
+    "",
+    choiceHint,
+    "",
+  ].join("\n");
+
+  return toolBlock + message;
+}
+
+function parseToolCallsFromText(text) {
+  if (!text) return null;
+  const jsonBlockRe = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?\s*```/;
+  const match = text.match(jsonBlockRe);
+  if (!match) {
+    const bareRe = /^\s*(\{\s*"tool_calls"\s*:\s*\[[\s\S]*?\]\s*\})\s*$/;
+    const bareMatch = text.match(bareRe);
+    if (!bareMatch) return null;
+    try {
+      const parsed = JSON.parse(bareMatch[1]);
+      if (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length) return parsed.tool_calls;
+    } catch (_) {}
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length) return parsed.tool_calls;
+  } catch (_) {}
+  return null;
+}
+
+function formatOpenAIToolCalls(toolCalls) {
+  return toolCalls.map((tc, i) => ({
+    id: `call_${randomId()}`,
+    type: "function",
+    function: {
+      name: tc.name,
+      arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments || {}),
+    },
+  }));
+}
+
+function formatAnthropicToolUseBlocks(toolCalls) {
+  return toolCalls.map((tc) => ({
+    type: "tool_use",
+    id: `toolu_${randomId()}`,
+    name: tc.name,
+    input: typeof tc.arguments === "string" ? JSON.parse(tc.arguments) : (tc.arguments || {}),
+  }));
 }
 
 function hasWebSearchTool(tools) {
